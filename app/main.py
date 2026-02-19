@@ -1,4 +1,4 @@
-﻿import json
+import json
 import os
 import shutil
 import subprocess
@@ -32,11 +32,29 @@ DOWNLOADS: Dict[str, Path] = {}
 
 class MergeRequest(BaseModel):
     drive_link: str = Field(..., description="Public Google Drive folder URL")
+    user_prompt: str = Field(..., min_length=1, description="User editing goal prompt")
     music_url: Optional[str] = Field(None, description="Optional public MP3 URL")
 
 
 class MergeResponse(BaseModel):
     download_url: str
+
+
+class GeneratePromptRequest(BaseModel):
+    raw_prompt: str = Field(..., min_length=1, description="Raw project description from user")
+
+
+class GeneratePromptResponse(BaseModel):
+    generated_prompt: str
+
+
+class ClipDecision(BaseModel):
+    description: str = ""
+    category: str = "irrelevant"
+    order_priority: int = 10
+    trim_start: float = 0.0
+    trim_end: float = 0.0
+    keep: bool = True
 
 
 def run_ffmpeg(args: List[str]) -> None:
@@ -132,75 +150,100 @@ def parse_json_response(text: str) -> Dict[str, Any]:
     return json.loads(cleaned)
 
 
-def analyze_with_gemini(video_paths: List[Path], temp_dir: Path) -> Dict[str, Any]:
+def generate_professional_prompt(raw_prompt: str) -> str:
     if not GEMINI_API_KEY:
-        return {
-            "ordered_clips": [
-                {
-                    "filename": path.name,
-                    "start_sec": 0.0,
-                    "end_sec": max(0.1, run_ffprobe_duration(path)),
-                }
-                for path in video_paths
-            ]
-        }
+        return raw_prompt.strip()
 
     model = genai.GenerativeModel("gemini-2.0-flash")
-    parts: List[Any] = [
-        (
-            "You are preparing clips for a merged video. "
-            "Return strict JSON only in this exact schema: "
-            '{"ordered_clips":[{"filename":"string","start_sec":0.0,"end_sec":1.0}]}. '
-            "Order clips for best narrative flow and suggest trim points. "
-            "Do not include unknown filenames."
+    prompt = (
+        "You are a professional video editor.\n"
+        f"The user described their video project as: {raw_prompt}\n"
+        "Convert this into a detailed, professional video editing\n"
+        "instruction prompt that includes: tone, style, clip ordering\n"
+        "logic, what to prioritize, what to skip.\n"
+        "Return only the improved prompt text, nothing else."
+    )
+    response = model.generate_content(prompt)
+    text = (response.text or "").strip()
+    if not text:
+        raise RuntimeError("Gemini returned empty prompt output.")
+    return text
+
+
+def analyze_clip_with_gemini(clip: Path, temp_dir: Path, user_prompt: str) -> ClipDecision:
+    duration = run_ffprobe_duration(clip)
+    if not GEMINI_API_KEY:
+        return ClipDecision(
+            description=f"Auto fallback: {clip.name}",
+            category="irrelevant",
+            order_priority=10,
+            trim_start=0.0,
+            trim_end=0.0,
+            keep=True,
         )
-    ]
 
-    for clip in video_paths:
-        duration = run_ffprobe_duration(clip)
-        thumb = temp_dir / f"{clip.stem}_thumb.jpg"
-        extract_thumbnail(clip, thumb)
-        with thumb.open("rb") as image_file:
-            image_bytes = image_file.read()
-        parts.append(f"Clip filename={clip.name}, duration_sec={duration:.2f}")
-        parts.append({"mime_type": "image/jpeg", "data": image_bytes})
+    model = genai.GenerativeModel("gemini-2.0-flash")
+    thumb = temp_dir / f"{clip.stem}_thumb.jpg"
+    extract_thumbnail(clip, thumb)
+    with thumb.open("rb") as image_file:
+        image_bytes = image_file.read()
 
-    response = model.generate_content(parts)
+    prompt = (
+        "You are a video editor assistant.\n"
+        f"The video project goal is: {user_prompt}\n"
+        "Analyze this video clip and return ONLY JSON:\n"
+        "{\n"
+        "  'description': 'what happens in this clip',\n"
+        "  'category': 'intro/product_detail/atmosphere/outro/irrelevant',\n"
+        "  'order_priority': 1-10 (1=first, 10=last),\n"
+        "  'trim_start': seconds to cut from start (0 if none),\n"
+        "  'trim_end': seconds to cut from end (0 if none),\n"
+        "  'keep': true/false\n"
+        "}\n"
+        "Return ONLY the JSON, no extra text.\n"
+        f"clip_filename={clip.name}, clip_duration_sec={duration:.2f}"
+    )
+    response = model.generate_content([prompt, {"mime_type": "image/jpeg", "data": image_bytes}])
+
     try:
         parsed = parse_json_response(response.text or "")
+        decision = ClipDecision.model_validate(parsed)
     except Exception as exc:
-        raise RuntimeError(f"Gemini JSON parse failed. Raw response: {response.text}") from exc
+        raise RuntimeError(f"Gemini clip parse failed for {clip.name}. Raw response: {response.text}") from exc
 
-    if "ordered_clips" not in parsed or not isinstance(parsed["ordered_clips"], list):
-        raise RuntimeError(f"Unexpected Gemini output: {parsed}")
+    decision.order_priority = max(1, min(10, int(decision.order_priority)))
+    decision.trim_start = max(0.0, float(decision.trim_start))
+    decision.trim_end = max(0.0, float(decision.trim_end))
+    return decision
 
-    return parsed
 
-
-def normalize_plan(plan: Dict[str, Any], video_paths: List[Path]) -> List[Dict[str, Any]]:
-    by_name = {p.name: p for p in video_paths}
-    normalized: List[Dict[str, Any]] = []
-    seen = set()
-
-    for item in plan.get("ordered_clips", []):
-        filename = item.get("filename")
-        if filename not in by_name or filename in seen:
-            continue
-        clip_path = by_name[filename]
-        duration = run_ffprobe_duration(clip_path)
-        start = float(item.get("start_sec", 0.0))
-        end = float(item.get("end_sec", duration))
-        start = max(0.0, min(start, duration - 0.05 if duration > 0.05 else duration))
-        end = max(start + 0.05, min(end, duration))
-        normalized.append({"path": clip_path, "start": start, "end": end})
-        seen.add(filename)
-
+def build_processing_plan(video_paths: List[Path], temp_dir: Path, user_prompt: str) -> List[Dict[str, Any]]:
+    plan: List[Dict[str, Any]] = []
     for clip in video_paths:
-        if clip.name not in seen:
-            duration = run_ffprobe_duration(clip)
-            normalized.append({"path": clip, "start": 0.0, "end": duration})
+        decision = analyze_clip_with_gemini(clip, temp_dir, user_prompt)
+        if not decision.keep:
+            continue
 
-    return normalized
+        duration = run_ffprobe_duration(clip)
+        start = min(decision.trim_start, duration)
+        end = duration - decision.trim_end
+        end = min(max(end, start + 0.05), duration)
+        start = max(0.0, min(start, end - 0.05 if end > 0.05 else end))
+
+        plan.append(
+            {
+                "path": clip,
+                "start": start,
+                "end": end,
+                "order_priority": decision.order_priority,
+            }
+        )
+
+    if not plan:
+        raise RuntimeError("No clips were selected after Gemini analysis.")
+
+    plan.sort(key=lambda item: (item["order_priority"], item["path"].name.lower()))
+    return plan
 
 
 def trim_clip(in_path: Path, out_path: Path, start: float, end: float) -> None:
@@ -297,7 +340,7 @@ def add_background_music(video_path: Path, music_path: Path, out_path: Path) -> 
         )
 
 
-def process_merge(drive_link: str, music_url: Optional[str]) -> Path:
+def process_merge(drive_link: str, user_prompt: str, music_url: Optional[str]) -> Path:
     with tempfile.TemporaryDirectory(prefix="video_merge_") as temp_str:
         temp_dir = Path(temp_str)
         source_dir = temp_dir / "source"
@@ -317,8 +360,7 @@ def process_merge(drive_link: str, music_url: Optional[str]) -> Path:
         if not video_files:
             raise RuntimeError("No video files found in provided Drive folder.")
 
-        gemini_plan = analyze_with_gemini(video_files, temp_dir)
-        processing_plan = normalize_plan(gemini_plan, video_files)
+        processing_plan = build_processing_plan(video_files, temp_dir, user_prompt)
 
         cut_dir = temp_dir / "cut"
         cut_dir.mkdir(parents=True, exist_ok=True)
@@ -365,7 +407,7 @@ def cleanup_download_file(download_id: str) -> None:
 @app.post("/merge", response_model=MergeResponse)
 def merge_videos(payload: MergeRequest, request: Request) -> MergeResponse:
     try:
-        final_path = process_merge(payload.drive_link, payload.music_url)
+        final_path = process_merge(payload.drive_link, payload.user_prompt, payload.music_url)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -373,6 +415,15 @@ def merge_videos(payload: MergeRequest, request: Request) -> MergeResponse:
     DOWNLOADS[download_id] = final_path
     download_url = str(request.base_url).rstrip("/") + f"/download/{download_id}"
     return MergeResponse(download_url=download_url)
+
+
+@app.post("/generate-prompt", response_model=GeneratePromptResponse)
+def generate_prompt(payload: GeneratePromptRequest) -> GeneratePromptResponse:
+    try:
+        generated = generate_professional_prompt(payload.raw_prompt)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return GeneratePromptResponse(generated_prompt=generated)
 
 
 @app.get("/download/{download_id}")
